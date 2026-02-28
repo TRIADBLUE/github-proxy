@@ -5,6 +5,14 @@ const TARGET = 'https://consoleblue.triadblue.com';
 const PORT = process.env.PORT || 3000;
 const GITHUB_ORG = process.env.GITHUB_ORG || 'TRIADBLUE';
 
+// CORS preflight for all routes
+app.options('*', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key, Authorization');
+  res.sendStatus(204);
+});
+
 // /repos — query GitHub API directly for the org's repos
 app.get('/api/github/repos', async (req, res) => {
   const url = `https://api.github.com/orgs/${GITHUB_ORG}/repos?per_page=100`;
@@ -67,7 +75,7 @@ app.use('/api/github', async (req, res) => {
 
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'consoleblue-github-proxy', version: '1.1' });
+  res.json({ status: 'ok', service: 'consoleblue-github-proxy', version: '1.2' });
 });
 
 app.listen(PORT, () => {
