@@ -5,12 +5,25 @@ const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/ser
 const { z } = require('zod');
 
 const app = express();
-app.use(express.json());
 
 const TARGET = 'https://consoleblue.triadblue.com';
 const PORT = process.env.PORT || 3000;
 const GITHUB_ORG = process.env.GITHUB_ORG || 'TRIADBLUE';
 const GITHUB_API = 'https://api.github.com';
+
+// --- CORS middleware (must be first) ---
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, x-api-key, Authorization, mcp-session-id, Mcp-Session-Id, Last-Event-ID');
+  res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id, Mcp-Session-Id');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+app.use(express.json());
 
 // --- GitHub API helper ---
 function ghHeaders() {
@@ -34,6 +47,40 @@ async function ghFetch(path) {
   return res.json();
 }
 
+// --- In-memory event store for session resumability ---
+class InMemoryEventStore {
+  constructor() {
+    this.events = new Map();
+  }
+
+  async storeEvent(streamId, message) {
+    const eventId = `${streamId}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    this.events.set(eventId, { streamId, message });
+    if (this.events.size > 1000) {
+      const keys = [...this.events.keys()];
+      for (let i = 0; i < keys.length - 1000; i++) {
+        this.events.delete(keys[i]);
+      }
+    }
+    return eventId;
+  }
+
+  async replayEventsAfter(lastEventId, { send }) {
+    if (!lastEventId || !this.events.has(lastEventId)) return '';
+    const parts = lastEventId.split('_');
+    const streamId = parts.length > 0 ? parts[0] : '';
+    if (!streamId) return '';
+    let foundLast = false;
+    const sorted = [...this.events.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    for (const [eventId, { streamId: sid, message }] of sorted) {
+      if (sid !== streamId) continue;
+      if (eventId === lastEventId) { foundLast = true; continue; }
+      if (foundLast) await send(eventId, message);
+    }
+    return streamId;
+  }
+}
+
 // --- MCP Server setup ---
 function createMcpServer() {
   const server = new McpServer({
@@ -41,7 +88,6 @@ function createMcpServer() {
     version: '1.0.0',
   });
 
-  // List all repos
   server.tool('list_repos', 'List all repositories in the TRIADBLUE org', {}, async () => {
     const repos = await ghFetch(`/orgs/${GITHUB_ORG}/repos?per_page=100`);
     const summary = repos.map(r => ({
@@ -56,7 +102,6 @@ function createMcpServer() {
     return { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] };
   });
 
-  // Get repo details
   server.tool('get_repo', 'Get details about a specific repo', {
     repo: z.string().describe('Repository name'),
   }, async ({ repo }) => {
@@ -64,7 +109,6 @@ function createMcpServer() {
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   });
 
-  // List directory contents
   server.tool('list_files', 'List files and directories in a repo path', {
     repo: z.string().describe('Repository name'),
     path: z.string().optional().describe('Directory path (empty for root)'),
@@ -77,7 +121,6 @@ function createMcpServer() {
     return { content: [{ type: 'text', text: JSON.stringify(listing, null, 2) }] };
   });
 
-  // Read a file
   server.tool('read_file', 'Read the contents of a file in a repo', {
     repo: z.string().describe('Repository name'),
     path: z.string().describe('File path'),
@@ -90,7 +133,6 @@ function createMcpServer() {
     return { content: [{ type: 'text', text: content }] };
   });
 
-  // List branches
   server.tool('list_branches', 'List branches of a repo', {
     repo: z.string().describe('Repository name'),
   }, async ({ repo }) => {
@@ -99,7 +141,6 @@ function createMcpServer() {
     return { content: [{ type: 'text', text: JSON.stringify(branches, null, 2) }] };
   });
 
-  // List issues
   server.tool('list_issues', 'List open issues for a repo', {
     repo: z.string().describe('Repository name'),
     state: z.enum(['open', 'closed', 'all']).optional().describe('Issue state filter'),
@@ -117,7 +158,6 @@ function createMcpServer() {
     return { content: [{ type: 'text', text: JSON.stringify(issues, null, 2) }] };
   });
 
-  // List pull requests
   server.tool('list_pulls', 'List pull requests for a repo', {
     repo: z.string().describe('Repository name'),
     state: z.enum(['open', 'closed', 'all']).optional().describe('PR state filter'),
@@ -136,7 +176,6 @@ function createMcpServer() {
     return { content: [{ type: 'text', text: JSON.stringify(prs, null, 2) }] };
   });
 
-  // Search code in the org
   server.tool('search_code', 'Search for code across all TRIADBLUE repos', {
     query: z.string().describe('Search query (code, filename, etc.)'),
   }, async ({ query }) => {
@@ -149,7 +188,6 @@ function createMcpServer() {
     return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
   });
 
-  // Get commit history
   server.tool('list_commits', 'List recent commits for a repo', {
     repo: z.string().describe('Repository name'),
     branch: z.string().optional().describe('Branch name (defaults to main)'),
@@ -168,19 +206,29 @@ function createMcpServer() {
   return server;
 }
 
-// --- MCP HTTP endpoint (stateful) ---
-const sessions = new Map(); // sessionId -> { server, transport }
+// --- MCP session management ---
+const sessions = new Map();
+const eventStore = new InMemoryEventStore();
 
 function isInitializeRequest(body) {
   if (Array.isArray(body)) return body.some(m => m.method === 'initialize');
   return body?.method === 'initialize';
 }
 
-app.post('/mcp', async (req, res) => {
-  try {
-    const sessionId = req.headers['mcp-session-id'];
+function getSessionId(req) {
+  // Support both casings
+  return req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id'];
+}
 
+async function handleMcpPost(req, res) {
+  const ts = new Date().toISOString();
+  const method = Array.isArray(req.body) ? req.body.map(m => m.method).join(',') : req.body?.method;
+  const sessionId = getSessionId(req);
+  console.log(`[${ts}] MCP POST method=${method} session=${sessionId || 'none'}`);
+
+  try {
     if (sessionId && sessions.has(sessionId)) {
+      console.log(`[${ts}] MCP → reusing session ${sessionId}`);
       const { transport } = sessions.get(sessionId);
       await transport.handleRequest(req, res, req.body);
       return;
@@ -193,63 +241,86 @@ app.post('/mcp', async (req, res) => {
           assignedSessionId = crypto.randomUUID();
           return assignedSessionId;
         },
+        eventStore,
       });
       const server = createMcpServer();
 
       transport.onclose = () => {
         if (assignedSessionId) sessions.delete(assignedSessionId);
-        console.log(`MCP session closed: ${assignedSessionId}`);
+        console.log(`[${ts}] MCP session closed: ${assignedSessionId}`);
       };
 
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
       if (assignedSessionId) {
         sessions.set(assignedSessionId, { server, transport });
-        console.log(`MCP session created: ${assignedSessionId}`);
+        console.log(`[${ts}] MCP session created: ${assignedSessionId} (total: ${sessions.size})`);
       }
       return;
     }
 
+    console.log(`[${ts}] MCP → session not found: ${sessionId}, active: [${[...sessions.keys()].join(', ')}]`);
     res.status(400).json({
       jsonrpc: '2.0',
       error: { code: -32000, message: 'Bad request — missing or invalid session' },
       id: null,
     });
   } catch (err) {
-    console.error('MCP error:', err);
+    console.error(`[${ts}] MCP POST error:`, err);
     if (!res.headersSent) {
       res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error' }, id: null });
     }
   }
-});
+}
 
-app.get('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'];
+async function handleMcpGet(req, res) {
+  const ts = new Date().toISOString();
+  const sessionId = getSessionId(req);
+  console.log(`[${ts}] MCP GET session=${sessionId || 'none'} last-event-id=${req.headers['last-event-id'] || 'none'}`);
+
   if (!sessionId || !sessions.has(sessionId)) {
-    res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Invalid or missing session' }, id: null });
+    // 405 not 400 — tells Claude "POST-only by design, keep going"
+    res.setHeader('Allow', 'POST');
+    res.status(405).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method not allowed — use POST' },
+      id: null,
+    });
     return;
   }
   const { transport } = sessions.get(sessionId);
   await transport.handleRequest(req, res);
-});
+}
 
-app.delete('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'];
+async function handleMcpDelete(req, res) {
+  const ts = new Date().toISOString();
+  const sessionId = getSessionId(req);
+  console.log(`[${ts}] MCP DELETE session=${sessionId || 'none'}`);
+
   if (!sessionId || !sessions.has(sessionId)) {
-    res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Invalid or missing session' }, id: null });
+    res.status(404).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Session not found' },
+      id: null,
+    });
     return;
   }
   const { transport } = sessions.get(sessionId);
   await transport.handleRequest(req, res);
-});
+}
 
-// --- CORS preflight for all routes ---
-app.options('*', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key, Authorization, mcp-session-id');
-  res.sendStatus(204);
-});
+function handleMcpHead(req, res) {
+  res.setHeader('MCP-Protocol-Version', '2025-11-25');
+  res.setHeader('Content-Type', 'application/json');
+  res.sendStatus(200);
+}
+
+// --- Mount MCP on BOTH /mcp and / ---
+// /mcp routes (explicit path — HEAD before GET so Express doesn't auto-handle)
+app.head('/mcp', handleMcpHead);
+app.post('/mcp', handleMcpPost);
+app.get('/mcp', handleMcpGet);
+app.delete('/mcp', handleMcpDelete);
 
 // --- /repos — direct GitHub API ---
 app.get('/api/github/repos', async (req, res) => {
@@ -261,7 +332,6 @@ app.get('/api/github/repos', async (req, res) => {
     console.log(`GITHUB API ← ${response.status} (${data.length} bytes)`);
     res.status(response.status);
     res.setHeader('Content-Type', response.headers.get('content-type') || 'application/json');
-    res.setHeader('Access-Control-Allow-Origin', '*');
     res.send(data);
   } catch (err) {
     console.error(`GITHUB API ERROR: ${err.message}`);
@@ -286,7 +356,6 @@ app.use('/api/github', async (req, res) => {
     console.log(`PROXY ← ${response.status} (${data.length} bytes)`);
     res.status(response.status);
     res.setHeader('Content-Type', response.headers.get('content-type') || 'application/json');
-    res.setHeader('Access-Control-Allow-Origin', '*');
     res.send(data);
   } catch (err) {
     console.error(`PROXY ERROR: ${err.message}`);
@@ -294,9 +363,24 @@ app.use('/api/github', async (req, res) => {
   }
 });
 
-// --- Health check ---
+// --- Root: MCP (POST/HEAD/DELETE) or health check (GET without session) ---
+app.post('/', handleMcpPost);
+app.head('/', handleMcpHead);
+app.delete('/', handleMcpDelete);
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'consoleblue-github-proxy', version: '2.0', mcp: '/mcp' });
+  const sessionId = getSessionId(req);
+  // If it has a session header, treat as MCP GET
+  if (sessionId) {
+    return handleMcpGet(req, res);
+  }
+  // Otherwise health check
+  res.json({
+    status: 'ok',
+    service: 'consoleblue-github-proxy',
+    version: '2.2',
+    mcp: '/mcp',
+    activeSessions: sessions.size,
+  });
 });
 
 app.listen(PORT, () => {
