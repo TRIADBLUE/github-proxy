@@ -15,8 +15,8 @@ const GITHUB_API = 'https://api.github.com';
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, x-api-key, Authorization, mcp-session-id, Mcp-Session-Id, Last-Event-ID');
-  res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id, Mcp-Session-Id');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, x-api-key, Authorization, mcp-session-id, Mcp-Session-Id, Last-Event-ID, MCP-Protocol-Version');
+  res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id, Mcp-Session-Id, MCP-Protocol-Version');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(204);
   }
@@ -207,7 +207,7 @@ function createMcpServer() {
 }
 
 // --- MCP session management ---
-const sessions = new Map();
+const sessions = new Map(); // sessionId -> { server, transport, createdAt }
 const eventStore = new InMemoryEventStore();
 
 function isInitializeRequest(body) {
@@ -216,9 +216,19 @@ function isInitializeRequest(body) {
 }
 
 function getSessionId(req) {
-  // Support both casings
   return req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id'];
 }
+
+// Clean up stale sessions every 5 minutes (30 min TTL)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of sessions) {
+    if (now - session.createdAt > 30 * 60 * 1000) {
+      sessions.delete(id);
+      console.log(`[cleanup] Removed stale session: ${id}`);
+    }
+  }
+}, 5 * 60 * 1000);
 
 async function handleMcpPost(req, res) {
   const ts = new Date().toISOString();
@@ -227,6 +237,7 @@ async function handleMcpPost(req, res) {
   console.log(`[${ts}] MCP POST method=${method} session=${sessionId || 'none'}`);
 
   try {
+    // Existing session — forward request
     if (sessionId && sessions.has(sessionId)) {
       console.log(`[${ts}] MCP → reusing session ${sessionId}`);
       const { transport } = sessions.get(sessionId);
@@ -234,31 +245,32 @@ async function handleMcpPost(req, res) {
       return;
     }
 
+    // New session — initialize
     if (!sessionId && isInitializeRequest(req.body)) {
-      let assignedSessionId;
       const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => {
-          assignedSessionId = crypto.randomUUID();
-          return assignedSessionId;
-        },
+        sessionIdGenerator: () => crypto.randomUUID(),
         eventStore,
+        enableJsonResponse: true, // JSON not SSE — avoids stream close killing session
+        onsessioninitialized: (sid) => {
+          sessions.set(sid, { server, transport, createdAt: Date.now() });
+          console.log(`[${ts}] MCP session created: ${sid} (total: ${sessions.size})`);
+        },
+        onsessionclosed: (sid) => {
+          sessions.delete(sid);
+          console.log(`[${ts}] MCP session explicitly closed: ${sid}`);
+        },
       });
       const server = createMcpServer();
 
-      transport.onclose = () => {
-        if (assignedSessionId) sessions.delete(assignedSessionId);
-        console.log(`[${ts}] MCP session closed: ${assignedSessionId}`);
-      };
+      // DO NOT set transport.onclose — that fires on every stream end
+      // and was killing sessions immediately. Use onsessionclosed instead.
 
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
-      if (assignedSessionId) {
-        sessions.set(assignedSessionId, { server, transport });
-        console.log(`[${ts}] MCP session created: ${assignedSessionId} (total: ${sessions.size})`);
-      }
       return;
     }
 
+    // Session not found
     console.log(`[${ts}] MCP → session not found: ${sessionId}, active: [${[...sessions.keys()].join(', ')}]`);
     res.status(400).json({
       jsonrpc: '2.0',
@@ -276,20 +288,22 @@ async function handleMcpPost(req, res) {
 async function handleMcpGet(req, res) {
   const ts = new Date().toISOString();
   const sessionId = getSessionId(req);
-  console.log(`[${ts}] MCP GET session=${sessionId || 'none'} last-event-id=${req.headers['last-event-id'] || 'none'}`);
+  console.log(`[${ts}] MCP GET session=${sessionId || 'none'}`);
 
-  if (!sessionId || !sessions.has(sessionId)) {
-    // 405 not 400 — tells Claude "POST-only by design, keep going"
-    res.setHeader('Allow', 'POST');
-    res.status(405).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Method not allowed — use POST' },
-      id: null,
-    });
+  if (sessionId && sessions.has(sessionId)) {
+    const { transport } = sessions.get(sessionId);
+    await transport.handleRequest(req, res);
     return;
   }
-  const { transport } = sessions.get(sessionId);
-  await transport.handleRequest(req, res);
+
+  // No valid session — return 405 with Allow header
+  // (tells Claude "use POST, server is fine" — NOT 501 which means "broken")
+  res.setHeader('Allow', 'POST, HEAD');
+  res.status(405).json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Method not allowed — use POST' },
+    id: null,
+  });
 }
 
 async function handleMcpDelete(req, res) {
@@ -297,16 +311,17 @@ async function handleMcpDelete(req, res) {
   const sessionId = getSessionId(req);
   console.log(`[${ts}] MCP DELETE session=${sessionId || 'none'}`);
 
-  if (!sessionId || !sessions.has(sessionId)) {
-    res.status(404).json({
-      jsonrpc: '2.0',
-      error: { code: -32000, message: 'Session not found' },
-      id: null,
-    });
+  if (sessionId && sessions.has(sessionId)) {
+    const { transport } = sessions.get(sessionId);
+    await transport.handleRequest(req, res);
     return;
   }
-  const { transport } = sessions.get(sessionId);
-  await transport.handleRequest(req, res);
+
+  res.status(404).json({
+    jsonrpc: '2.0',
+    error: { code: -32001, message: 'Session not found' },
+    id: null,
+  });
 }
 
 function handleMcpHead(req, res) {
@@ -315,12 +330,16 @@ function handleMcpHead(req, res) {
   res.sendStatus(200);
 }
 
-// --- Mount MCP on BOTH /mcp and / ---
-// /mcp routes (explicit path — HEAD before GET so Express doesn't auto-handle)
+// --- Mount MCP on /mcp (HEAD first so Express doesn't auto-handle via GET) ---
 app.head('/mcp', handleMcpHead);
 app.post('/mcp', handleMcpPost);
 app.get('/mcp', handleMcpGet);
 app.delete('/mcp', handleMcpDelete);
+
+// --- Mount MCP on root / too (Claude.ai may use root path) ---
+app.head('/', handleMcpHead);
+app.post('/', handleMcpPost);
+app.delete('/', handleMcpDelete);
 
 // --- /repos — direct GitHub API ---
 app.get('/api/github/repos', async (req, res) => {
@@ -363,21 +382,16 @@ app.use('/api/github', async (req, res) => {
   }
 });
 
-// --- Root: MCP (POST/HEAD/DELETE) or health check (GET without session) ---
-app.post('/', handleMcpPost);
-app.head('/', handleMcpHead);
-app.delete('/', handleMcpDelete);
+// --- GET / without session header = health check ---
 app.get('/', (req, res) => {
   const sessionId = getSessionId(req);
-  // If it has a session header, treat as MCP GET
-  if (sessionId) {
+  if (sessionId && sessions.has(sessionId)) {
     return handleMcpGet(req, res);
   }
-  // Otherwise health check
   res.json({
     status: 'ok',
     service: 'consoleblue-github-proxy',
-    version: '2.2',
+    version: '2.3',
     mcp: '/mcp',
     activeSessions: sessions.size,
   });
