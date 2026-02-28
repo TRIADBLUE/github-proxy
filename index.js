@@ -198,7 +198,6 @@ app.post('/mcp', async (req, res) => {
 
       transport.onclose = () => {
         if (assignedSessionId) sessions.delete(assignedSessionId);
-        server.close();
         console.log(`MCP session closed: ${assignedSessionId}`);
       };
 
