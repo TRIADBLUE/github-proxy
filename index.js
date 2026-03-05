@@ -219,16 +219,7 @@ function getSessionId(req) {
   return req.headers['mcp-session-id'] || req.headers['Mcp-Session-Id'];
 }
 
-// Clean up stale sessions every 5 minutes (30 min TTL)
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (now - session.createdAt > 30 * 60 * 1000) {
-      sessions.delete(id);
-      console.log(`[cleanup] Removed stale session: ${id}`);
-    }
-  }
-}, 5 * 60 * 1000);
+// Session cleanup disabled — clients don't reliably re-initialize after expiry
 
 async function handleMcpPost(req, res) {
   const ts = new Date().toISOString();
