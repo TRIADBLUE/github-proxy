@@ -332,44 +332,66 @@ app.head('/', handleMcpHead);
 app.post('/', handleMcpPost);
 app.delete('/', handleMcpDelete);
 
-// --- /repos — direct GitHub API ---
+// --- REST endpoints for GitHub API ---
 app.get('/api/github/repos', async (req, res) => {
-  const url = `https://api.github.com/orgs/${GITHUB_ORG}/repos?per_page=100`;
-  console.log(`GITHUB API → GET ${url}`);
   try {
-    const response = await fetch(url, { headers: ghHeaders() });
-    const data = await response.text();
-    console.log(`GITHUB API ← ${response.status} (${data.length} bytes)`);
-    res.status(response.status);
-    res.setHeader('Content-Type', response.headers.get('content-type') || 'application/json');
-    res.send(data);
+    const repos = await ghFetch(`/orgs/${GITHUB_ORG}/repos?per_page=100`);
+    const summary = repos.map(r => ({ name: r.name, description: r.description, language: r.language, updated_at: r.updated_at, html_url: r.html_url }));
+    res.json(summary);
   } catch (err) {
-    console.error(`GITHUB API ERROR: ${err.message}`);
-    res.status(502).json({ error: 'GitHub API error', message: err.message });
+    res.status(502).json({ error: err.message });
   }
 });
 
-// --- Proxy all other /api/github/* to consoleblue ---
-app.use('/api/github', async (req, res) => {
-  const url = `${TARGET}${req.originalUrl}`;
-  console.log(`PROXY → ${req.method} ${url}`);
+app.get('/api/github/files', async (req, res) => {
+  const { repo, path } = req.query;
+  if (!repo) return res.status(400).json({ error: 'repo parameter required' });
   try {
-    const response = await fetch(url, {
-      method: req.method,
-      headers: {
-        'x-api-key': req.query.api_key || req.headers['x-api-key'] || '',
-        'content-type': 'application/json',
-        'user-agent': 'consoleblue-github-proxy/1.0',
-      },
-    });
-    const data = await response.text();
-    console.log(`PROXY ← ${response.status} (${data.length} bytes)`);
-    res.status(response.status);
-    res.setHeader('Content-Type', response.headers.get('content-type') || 'application/json');
-    res.send(data);
+    const data = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/contents/${path || ''}`);
+    const listing = Array.isArray(data)
+      ? data.map(f => ({ name: f.name, type: f.type, size: f.size, path: f.path }))
+      : [{ name: data.name, type: data.type, size: data.size, path: data.path }];
+    res.json(listing);
   } catch (err) {
-    console.error(`PROXY ERROR: ${err.message}`);
-    res.status(502).json({ error: 'Proxy error', message: err.message });
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get('/api/github/file', async (req, res) => {
+  const { repo, path } = req.query;
+  if (!repo || !path) return res.status(400).json({ error: 'repo and path parameters required' });
+  try {
+    const data = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`);
+    if (data.type !== 'file') return res.status(400).json({ error: `${path} is a ${data.type}, not a file` });
+    const content = Buffer.from(data.content, 'base64').toString('utf-8');
+    res.type('text/plain').send(content);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get('/api/github/commits', async (req, res) => {
+  const { repo, branch } = req.query;
+  if (!repo) return res.status(400).json({ error: 'repo parameter required' });
+  try {
+    const b = branch ? `&sha=${branch}` : '';
+    const data = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/commits?per_page=20${b}`);
+    const commits = data.map(c => ({ sha: c.sha.slice(0, 7), message: c.commit.message.split('\n')[0], author: c.commit.author.name, date: c.commit.author.date }));
+    res.json(commits);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get('/api/github/branches', async (req, res) => {
+  const { repo } = req.query;
+  if (!repo) return res.status(400).json({ error: 'repo parameter required' });
+  try {
+    const data = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/branches?per_page=100`);
+    const branches = data.map(b => ({ name: b.name, sha: b.commit.sha }));
+    res.json(branches);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
   }
 });
 
